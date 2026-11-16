@@ -1,0 +1,2389 @@
+--
+-- PostgreSQL database dump
+--
+
+
+-- Dumped from database version 17.6
+-- Dumped by pg_dump version 17.9
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA IF NOT EXISTS "AutoSpace";
+GRANT USAGE, CREATE ON SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON ROUTINES TO anon, authenticated, service_role;
+
+COMMENT ON SCHEMA "AutoSpace" IS 'AutoSpace schema';
+
+
+--
+-- Name: app_role; Type: TYPE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TYPE "AutoSpace".app_role AS ENUM (
+    'super_admin',
+    'business_user'
+);
+
+
+--
+-- Name: plan_tier; Type: TYPE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TYPE "AutoSpace".plan_tier AS ENUM (
+    'free',
+    'pro',
+    'enterprise'
+);
+
+
+--
+-- Name: can_read_usage(uuid); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".can_read_usage(_user_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+  SELECT auth.uid() IS NULL
+      OR auth.uid() = _user_id
+      OR "AutoSpace".has_role(auth.uid(), 'super_admin'::app_role)
+      OR "AutoSpace".is_staff_of(auth.uid(), _user_id)
+$$;
+
+
+--
+-- Name: enforce_order_limit(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".enforce_order_limit() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+DECLARE
+  current_count INT;
+  max_allowed INT;
+  tier TEXT;
+  addon INT;
+  plan_max INT;
+  platform_limits JSONB;
+  billing_start TIMESTAMPTZ;
+  month_start TIMESTAMPTZ;
+  next_date TIMESTAMPTZ;
+  user_paused BOOLEAN;
+BEGIN
+  SELECT p.plan_tier, p.addon_orders, p.billing_cycle_start, p.is_paused
+  INTO tier, addon, billing_start, user_paused
+  FROM profiles p WHERE p.user_id = NEW.user_id;
+
+  IF user_paused = true THEN
+    RAISE EXCEPTION 'Account is paused. Cannot create orders.';
+  END IF;
+
+  IF tier IS NULL THEN
+    tier := 'free';
+    addon := 0;
+  END IF;
+
+  -- Calculate billing month start
+  IF billing_start IS NOT NULL THEN
+    month_start := billing_start;
+    LOOP
+      next_date := month_start + INTERVAL '1 month';
+      EXIT WHEN next_date > NOW();
+      month_start := next_date;
+    END LOOP;
+  ELSE
+    month_start := date_trunc('month', NOW());
+  END IF;
+
+  SELECT ps.value INTO platform_limits
+  FROM platform_settings ps WHERE ps.key = 'plan_limits';
+
+  IF platform_limits IS NOT NULL AND platform_limits->tier IS NOT NULL THEN
+    plan_max := COALESCE((platform_limits->tier->>'max_orders_per_month')::INT, 50);
+  ELSE
+    plan_max := CASE tier WHEN 'pro' THEN 500 WHEN 'enterprise' THEN 9999 ELSE 50 END;
+  END IF;
+
+  max_allowed := plan_max + COALESCE(addon, 0);
+
+  SELECT COUNT(*) INTO current_count
+  FROM orders WHERE user_id = NEW.user_id AND created_at >= month_start;
+
+  IF current_count >= max_allowed THEN
+    RAISE EXCEPTION 'Monthly order limit reached (% of %). Upgrade your plan to process more orders.', current_count, max_allowed;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: get_ai_message_usage(uuid, timestamp with time zone); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".get_ai_message_usage(_user_id uuid, _since timestamp with time zone) RETURNS integer
+    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+DECLARE c integer;
+BEGIN
+  IF NOT "AutoSpace".can_read_usage(_user_id) THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+  SELECT COUNT(*) INTO c
+  FROM "AutoSpace".ai_usage_logs
+  WHERE user_id = _user_id AND created_at >= _since;
+  RETURN COALESCE(c, 0);
+END;
+$$;
+
+
+--
+-- Name: get_contact_usage(uuid, timestamp with time zone); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".get_contact_usage(_user_id uuid, _since timestamp with time zone) RETURNS integer
+    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+DECLARE c integer;
+BEGIN
+  IF NOT "AutoSpace".can_read_usage(_user_id) THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+  SELECT COUNT(DISTINCT phone_number) INTO c
+  FROM "AutoSpace".contact_usage
+  WHERE user_id = _user_id AND created_at >= _since;
+  RETURN COALESCE(c, 0);
+END;
+$$;
+
+
+--
+-- Name: get_staff_owner_id(uuid); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".get_staff_owner_id(_user_id uuid) RETURNS uuid
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+  SELECT owner_id FROM "AutoSpace".staff_accounts
+  WHERE staff_user_id = _user_id AND is_active = true
+  LIMIT 1
+$$;
+
+
+--
+-- Name: handle_new_user(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".handle_new_user() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+BEGIN
+  INSERT INTO "AutoSpace".profiles (user_id, email, full_name)
+  VALUES (NEW.id, NEW.email, COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.email));
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: handle_new_user_role(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".handle_new_user_role() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+BEGIN
+  INSERT INTO "AutoSpace".user_roles (user_id, role)
+  VALUES (NEW.id, 'business_user');
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: handle_new_user_settings(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".handle_new_user_settings() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+BEGIN
+  INSERT INTO "AutoSpace".settings (user_id, key, value) VALUES
+    (NEW.id, 'welcome_message', '{"text": "Welcome! How can I help you today?"}'::jsonb),
+    (NEW.id, 'payment_info', '{"bank_name": "", "account_number": "", "account_name": ""}'::jsonb),
+    (NEW.id, 'auto_responses', '{"enabled": true}'::jsonb);
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: has_role(uuid, "AutoSpace".app_role); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".has_role(_user_id uuid, _role "AutoSpace".app_role) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM "AutoSpace".user_roles
+    WHERE user_id = _user_id AND role = _role
+  )
+$$;
+
+
+--
+-- Name: is_admin(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".is_admin() RETURNS boolean
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM "AutoSpace".profiles
+    WHERE user_id = auth.uid()
+  );
+END;
+$$;
+
+
+--
+-- Name: is_staff_of(uuid, uuid); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".is_staff_of(_staff_user_id uuid, _owner_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM "AutoSpace".staff_accounts
+    WHERE staff_user_id = _staff_user_id
+      AND owner_id = _owner_id
+      AND is_active = true
+  )
+$$;
+
+
+--
+-- Name: update_updated_at_column(); Type: FUNCTION; Schema: AutoSpace; Owner: -
+--
+
+CREATE FUNCTION "AutoSpace".update_updated_at_column() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO '"AutoSpace"', 'public'
+    AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: ai_usage_logs; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".ai_usage_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: chat_takeovers; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".chat_takeovers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    is_taken_over boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: contact_usage; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".contact_usage (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    period_start timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: conversations; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".conversations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    phone_number text NOT NULL,
+    message text NOT NULL,
+    direction text NOT NULL,
+    message_type text DEFAULT 'text'::text,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL,
+    CONSTRAINT conversations_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text])))
+);
+
+
+--
+-- Name: faq_usage_logs; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".faq_usage_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    faq_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    sender_name text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: faqs; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".faqs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    question text NOT NULL,
+    answer text NOT NULL,
+    product_id uuid,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL,
+    is_tracked boolean DEFAULT false NOT NULL,
+    media_urls text[] DEFAULT '{}'::text[] NOT NULL
+);
+
+
+--
+-- Name: fcm_tokens; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".fcm_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    device_token text NOT NULL,
+    device_name text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: leads; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".leads (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    customer_name text,
+    assigned_to uuid,
+    status text DEFAULT 'new'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    vehicle_details text,
+    service_requested text,
+    allocated_slot timestamp with time zone,
+    slot_status text DEFAULT 'allocated'::text
+);
+
+
+--
+-- Name: message_queue; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".message_queue (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    wsender_message_id text NOT NULL,
+    user_id uuid NOT NULL,
+    phone_number text NOT NULL,
+    sender_name text DEFAULT 'Unknown'::text,
+    message_text text DEFAULT ''::text,
+    message_type text DEFAULT 'text'::text,
+    session_api_key text,
+    raw_payload jsonb DEFAULT '{}'::jsonb,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    max_attempts integer DEFAULT 3 NOT NULL,
+    error_message text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    processed_at timestamp with time zone,
+    correlation_id text
+);
+
+
+--
+-- Name: orders; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".orders (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    customer_name text NOT NULL,
+    customer_phone text NOT NULL,
+    customer_address text,
+    order_items jsonb DEFAULT '[]'::jsonb NOT NULL,
+    special_instructions text,
+    payment_method text DEFAULT 'cod'::text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    total_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL,
+    whatsapp_phone text,
+    district text,
+    vehicle_details text,
+    service_requested text,
+    allocated_slot timestamp with time zone,
+    CONSTRAINT orders_payment_method_check CHECK ((payment_method = ANY (ARRAY['cod'::text, 'bank_transfer'::text, 'onsite'::text, 'workshop'::text]))),
+    CONSTRAINT orders_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'shipped'::text, 'delivered'::text, 'cancelled'::text, 'allocated'::text, 'checked_in'::text, 'completed'::text, 'rescheduled'::text])))
+);
+
+
+--
+-- Name: platform_settings; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".platform_settings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    key text NOT NULL,
+    value jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: products; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".products (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    description text,
+    price numeric(10,2) DEFAULT 0 NOT NULL,
+    product_type text DEFAULT 'physical'::text NOT NULL,
+    variations jsonb DEFAULT '[]'::jsonb,
+    images text[] DEFAULT '{}'::text[],
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL,
+    delivery_price numeric DEFAULT 0,
+    video_url text,
+    CONSTRAINT products_product_type_check CHECK ((product_type = ANY (ARRAY['physical'::text, 'digital'::text])))
+);
+
+
+--
+-- Name: profiles; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".profiles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    full_name text,
+    email text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    plan_tier "AutoSpace".plan_tier DEFAULT 'free'::"AutoSpace".plan_tier NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    business_name text,
+    max_products integer DEFAULT 5,
+    max_faqs integer DEFAULT 10,
+    billing_cycle_start timestamp with time zone DEFAULT now(),
+    is_paused boolean DEFAULT false NOT NULL,
+    addon_products integer DEFAULT 0 NOT NULL,
+    addon_faqs integer DEFAULT 0 NOT NULL,
+    addon_orders integer DEFAULT 0 NOT NULL,
+    addon_ai_messages integer DEFAULT 0 NOT NULL,
+    addon_images integer DEFAULT 0 NOT NULL,
+    addon_staff integer DEFAULT 0 NOT NULL,
+    addon_contacts integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: settings; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".settings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    key text NOT NULL,
+    value jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    user_id uuid NOT NULL
+);
+
+
+--
+-- Name: staff_accounts; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".staff_accounts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_id uuid NOT NULL,
+    staff_user_id uuid NOT NULL,
+    staff_email text NOT NULL,
+    staff_name text,
+    permissions text[] DEFAULT '{}'::text[] NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    whatsapp_number text
+);
+
+
+--
+-- Name: user_roles; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".user_roles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    role "AutoSpace".app_role DEFAULT 'business_user'::"AutoSpace".app_role NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: user_wsender_sessions; Type: TABLE; Schema: AutoSpace; Owner: -
+--
+
+CREATE TABLE "AutoSpace".user_wsender_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    session_id text NOT NULL,
+    session_name text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    session_api_key text
+);
+
+
+--
+-- Name: ai_usage_logs ai_usage_logs_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".ai_usage_logs
+    ADD CONSTRAINT ai_usage_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: chat_takeovers chat_takeovers_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".chat_takeovers
+    ADD CONSTRAINT chat_takeovers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: chat_takeovers chat_takeovers_user_id_phone_number_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".chat_takeovers
+    ADD CONSTRAINT chat_takeovers_user_id_phone_number_key UNIQUE (user_id, phone_number);
+
+
+--
+-- Name: contact_usage contact_usage_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".contact_usage
+    ADD CONSTRAINT contact_usage_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: conversations conversations_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".conversations
+    ADD CONSTRAINT conversations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: faq_usage_logs faq_usage_logs_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".faq_usage_logs
+    ADD CONSTRAINT faq_usage_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: faqs faqs_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".faqs
+    ADD CONSTRAINT faqs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fcm_tokens fcm_tokens_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".fcm_tokens
+    ADD CONSTRAINT fcm_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fcm_tokens fcm_tokens_user_id_device_token_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".fcm_tokens
+    ADD CONSTRAINT fcm_tokens_user_id_device_token_key UNIQUE (user_id, device_token);
+
+
+--
+-- Name: leads leads_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".leads
+    ADD CONSTRAINT leads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: leads leads_user_id_phone_number_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".leads
+    ADD CONSTRAINT leads_user_id_phone_number_key UNIQUE (user_id, phone_number);
+
+
+--
+-- Name: message_queue message_queue_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".message_queue
+    ADD CONSTRAINT message_queue_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: orders orders_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".orders
+    ADD CONSTRAINT orders_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_settings platform_settings_key_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".platform_settings
+    ADD CONSTRAINT platform_settings_key_key UNIQUE (key);
+
+
+--
+-- Name: platform_settings platform_settings_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".platform_settings
+    ADD CONSTRAINT platform_settings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: products products_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".products
+    ADD CONSTRAINT products_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: profiles profiles_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".profiles
+    ADD CONSTRAINT profiles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: profiles profiles_user_id_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".profiles
+    ADD CONSTRAINT profiles_user_id_key UNIQUE (user_id);
+
+
+--
+-- Name: settings settings_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".settings
+    ADD CONSTRAINT settings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: settings settings_user_id_key_unique; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".settings
+    ADD CONSTRAINT settings_user_id_key_unique UNIQUE (user_id, key);
+
+
+--
+-- Name: staff_accounts staff_accounts_owner_id_staff_user_id_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".staff_accounts
+    ADD CONSTRAINT staff_accounts_owner_id_staff_user_id_key UNIQUE (owner_id, staff_user_id);
+
+
+--
+-- Name: staff_accounts staff_accounts_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".staff_accounts
+    ADD CONSTRAINT staff_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: message_queue unique_wsender_message; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".message_queue
+    ADD CONSTRAINT unique_wsender_message UNIQUE (wsender_message_id);
+
+
+--
+-- Name: user_roles user_roles_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_roles
+    ADD CONSTRAINT user_roles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_roles user_roles_user_id_role_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_roles
+    ADD CONSTRAINT user_roles_user_id_role_key UNIQUE (user_id, role);
+
+
+--
+-- Name: user_wsender_sessions user_wsender_sessions_pkey; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_wsender_sessions
+    ADD CONSTRAINT user_wsender_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_wsender_sessions user_wsender_sessions_user_id_session_id_key; Type: CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_wsender_sessions
+    ADD CONSTRAINT user_wsender_sessions_user_id_session_id_key UNIQUE (user_id, session_id);
+
+
+--
+-- Name: contact_usage_unique_per_cycle; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE UNIQUE INDEX contact_usage_unique_per_cycle ON "AutoSpace".contact_usage USING btree (user_id, phone_number, period_start);
+
+
+--
+-- Name: idx_ai_usage_logs_user_created; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_ai_usage_logs_user_created ON "AutoSpace".ai_usage_logs USING btree (user_id, created_at);
+
+
+--
+-- Name: idx_contact_usage_user_created; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_contact_usage_user_created ON "AutoSpace".contact_usage USING btree (user_id, created_at);
+
+
+--
+-- Name: idx_conversations_created_at; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_conversations_created_at ON "AutoSpace".conversations USING btree (created_at DESC);
+
+
+--
+-- Name: idx_conversations_phone; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_conversations_phone ON "AutoSpace".conversations USING btree (phone_number);
+
+
+--
+-- Name: idx_faq_usage_logs_faq_id; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_faq_usage_logs_faq_id ON "AutoSpace".faq_usage_logs USING btree (faq_id);
+
+
+--
+-- Name: idx_faq_usage_logs_user_phone; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_faq_usage_logs_user_phone ON "AutoSpace".faq_usage_logs USING btree (user_id, phone_number);
+
+
+--
+-- Name: idx_leads_assigned; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_leads_assigned ON "AutoSpace".leads USING btree (assigned_to);
+
+
+--
+-- Name: idx_leads_user; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_leads_user ON "AutoSpace".leads USING btree (user_id);
+
+
+--
+-- Name: idx_message_queue_processed; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_message_queue_processed ON "AutoSpace".message_queue USING btree (processed_at) WHERE (status = 'done'::text);
+
+
+--
+-- Name: idx_message_queue_status; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_message_queue_status ON "AutoSpace".message_queue USING btree (status, created_at) WHERE (status = ANY (ARRAY['pending'::text, 'failed'::text]));
+
+
+--
+-- Name: idx_message_queue_status_created; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_message_queue_status_created ON "AutoSpace".message_queue USING btree (status, created_at) WHERE (status = ANY (ARRAY['pending'::text, 'failed'::text]));
+
+
+--
+-- Name: idx_message_queue_user_processing; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_message_queue_user_processing ON "AutoSpace".message_queue USING btree (user_id) WHERE (status = 'processing'::text);
+
+
+--
+-- Name: idx_orders_created_at; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_orders_created_at ON "AutoSpace".orders USING btree (created_at DESC);
+
+
+--
+-- Name: idx_orders_status; Type: INDEX; Schema: AutoSpace; Owner: -
+--
+
+CREATE INDEX idx_orders_status ON "AutoSpace".orders USING btree (status);
+
+
+--
+-- Name: orders check_order_limit; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER check_order_limit BEFORE INSERT ON "AutoSpace".orders FOR EACH ROW EXECUTE FUNCTION "AutoSpace".enforce_order_limit();
+
+
+--
+-- Name: faqs update_faqs_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_faqs_updated_at BEFORE UPDATE ON "AutoSpace".faqs FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: fcm_tokens update_fcm_tokens_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_fcm_tokens_updated_at BEFORE UPDATE ON "AutoSpace".fcm_tokens FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: leads update_leads_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_leads_updated_at BEFORE UPDATE ON "AutoSpace".leads FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: message_queue update_message_queue_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_message_queue_updated_at BEFORE UPDATE ON "AutoSpace".message_queue FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: orders update_orders_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON "AutoSpace".orders FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: platform_settings update_platform_settings_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_platform_settings_updated_at BEFORE UPDATE ON "AutoSpace".platform_settings FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: products update_products_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_products_updated_at BEFORE UPDATE ON "AutoSpace".products FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: profiles update_profiles_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON "AutoSpace".profiles FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: settings update_settings_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_settings_updated_at BEFORE UPDATE ON "AutoSpace".settings FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: staff_accounts update_staff_accounts_updated_at; Type: TRIGGER; Schema: AutoSpace; Owner: -
+--
+
+CREATE TRIGGER update_staff_accounts_updated_at BEFORE UPDATE ON "AutoSpace".staff_accounts FOR EACH ROW EXECUTE FUNCTION "AutoSpace".update_updated_at_column();
+
+
+--
+-- Name: conversations conversations_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".conversations
+    ADD CONSTRAINT conversations_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: faq_usage_logs faq_usage_logs_faq_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".faq_usage_logs
+    ADD CONSTRAINT faq_usage_logs_faq_id_fkey FOREIGN KEY (faq_id) REFERENCES "AutoSpace".faqs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: faqs faqs_product_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".faqs
+    ADD CONSTRAINT faqs_product_id_fkey FOREIGN KEY (product_id) REFERENCES "AutoSpace".products(id) ON DELETE SET NULL;
+
+
+--
+-- Name: faqs faqs_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".faqs
+    ADD CONSTRAINT faqs_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: orders orders_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".orders
+    ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: products products_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".products
+    ADD CONSTRAINT products_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: profiles profiles_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".profiles
+    ADD CONSTRAINT profiles_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: settings settings_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".settings
+    ADD CONSTRAINT settings_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: staff_accounts staff_accounts_staff_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".staff_accounts
+    ADD CONSTRAINT staff_accounts_staff_user_id_fkey FOREIGN KEY (staff_user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_roles user_roles_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_roles
+    ADD CONSTRAINT user_roles_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_wsender_sessions user_wsender_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE ONLY "AutoSpace".user_wsender_sessions
+    ADD CONSTRAINT user_wsender_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: platform_settings Authenticated users can view platform settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Authenticated users can view platform settings" ON "AutoSpace".platform_settings FOR SELECT USING ((auth.uid() IS NOT NULL));
+
+
+--
+-- Name: staff_accounts Owners can create staff; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Owners can create staff" ON "AutoSpace".staff_accounts FOR INSERT WITH CHECK ((auth.uid() = owner_id));
+
+
+--
+-- Name: staff_accounts Owners can delete their staff; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Owners can delete their staff" ON "AutoSpace".staff_accounts FOR DELETE USING ((auth.uid() = owner_id));
+
+
+--
+-- Name: staff_accounts Owners can update their staff; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Owners can update their staff" ON "AutoSpace".staff_accounts FOR UPDATE USING ((auth.uid() = owner_id));
+
+
+--
+-- Name: staff_accounts Owners can view their staff; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Owners can view their staff" ON "AutoSpace".staff_accounts FOR SELECT USING ((auth.uid() = owner_id));
+
+
+--
+-- Name: leads Owners manage their leads; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Owners manage their leads" ON "AutoSpace".leads TO authenticated USING ((auth.uid() = user_id)) WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: profiles Service can insert profiles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Service can insert profiles" ON "AutoSpace".profiles FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: conversations Staff can create owner conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can create owner conversations" ON "AutoSpace".conversations FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = conversations.user_id) AND (sa.is_active = true) AND ('conversations'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: faqs Staff can create owner faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can create owner faqs" ON "AutoSpace".faqs FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = faqs.user_id) AND (sa.is_active = true) AND ('faqs'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: products Staff can create owner products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can create owner products" ON "AutoSpace".products FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = products.user_id) AND (sa.is_active = true) AND ('products'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: chat_takeovers Staff can manage owner takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can manage owner takeovers" ON "AutoSpace".chat_takeovers FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = chat_takeovers.user_id) AND (sa.is_active = true) AND ('conversations'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: faqs Staff can update owner faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can update owner faqs" ON "AutoSpace".faqs FOR UPDATE USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = faqs.user_id) AND (sa.is_active = true) AND ('faqs'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: orders Staff can update owner orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can update owner orders" ON "AutoSpace".orders FOR UPDATE USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = orders.user_id) AND (sa.is_active = true) AND ('orders'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: products Staff can update owner products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can update owner products" ON "AutoSpace".products FOR UPDATE USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = products.user_id) AND (sa.is_active = true) AND ('products'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: chat_takeovers Staff can update owner takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can update owner takeovers" ON "AutoSpace".chat_takeovers FOR UPDATE USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = chat_takeovers.user_id) AND (sa.is_active = true) AND ('conversations'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: staff_accounts Staff can view own record; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view own record" ON "AutoSpace".staff_accounts FOR SELECT USING ((auth.uid() = staff_user_id));
+
+
+--
+-- Name: conversations Staff can view owner conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner conversations" ON "AutoSpace".conversations FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = conversations.user_id) AND (sa.is_active = true) AND ('conversations'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: faq_usage_logs Staff can view owner faq usage logs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner faq usage logs" ON "AutoSpace".faq_usage_logs FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = faq_usage_logs.user_id) AND (sa.is_active = true) AND ('faqs'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: faqs Staff can view owner faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner faqs" ON "AutoSpace".faqs FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = faqs.user_id) AND (sa.is_active = true) AND ('faqs'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: orders Staff can view owner orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner orders" ON "AutoSpace".orders FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = orders.user_id) AND (sa.is_active = true) AND ('orders'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: products Staff can view owner products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner products" ON "AutoSpace".products FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = products.user_id) AND (sa.is_active = true) AND ('products'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: profiles Staff can view owner profile; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner profile" ON "AutoSpace".profiles FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = profiles.user_id) AND (sa.is_active = true)))));
+
+
+--
+-- Name: settings Staff can view owner settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner settings" ON "AutoSpace".settings FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = settings.user_id) AND (sa.is_active = true)))));
+
+
+--
+-- Name: chat_takeovers Staff can view owner takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff can view owner takeovers" ON "AutoSpace".chat_takeovers FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "AutoSpace".staff_accounts sa
+  WHERE ((sa.staff_user_id = auth.uid()) AND (sa.owner_id = chat_takeovers.user_id) AND (sa.is_active = true) AND ('conversations'::text = ANY (sa.permissions))))));
+
+
+--
+-- Name: leads Staff insert owner leads; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff insert owner leads" ON "AutoSpace".leads FOR INSERT TO authenticated WITH CHECK ("AutoSpace".is_staff_of(auth.uid(), user_id));
+
+
+--
+-- Name: leads Staff update owner leads; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff update owner leads" ON "AutoSpace".leads FOR UPDATE TO authenticated USING ("AutoSpace".is_staff_of(auth.uid(), user_id)) WITH CHECK ("AutoSpace".is_staff_of(auth.uid(), user_id));
+
+
+--
+-- Name: leads Staff view owner leads; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Staff view owner leads" ON "AutoSpace".leads FOR SELECT TO authenticated USING ("AutoSpace".is_staff_of(auth.uid(), user_id));
+
+
+--
+-- Name: faqs Super admins can delete all faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can delete all faqs" ON "AutoSpace".faqs FOR DELETE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: platform_settings Super admins can delete platform settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can delete platform settings" ON "AutoSpace".platform_settings FOR DELETE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: user_roles Super admins can delete roles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can delete roles" ON "AutoSpace".user_roles FOR DELETE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: platform_settings Super admins can insert platform settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can insert platform settings" ON "AutoSpace".platform_settings FOR INSERT WITH CHECK ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: user_roles Super admins can manage roles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can manage roles" ON "AutoSpace".user_roles FOR INSERT WITH CHECK ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: faqs Super admins can update all faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update all faqs" ON "AutoSpace".faqs FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: orders Super admins can update all orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update all orders" ON "AutoSpace".orders FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: profiles Super admins can update all profiles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update all profiles" ON "AutoSpace".profiles FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: settings Super admins can update all settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update all settings" ON "AutoSpace".settings FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: platform_settings Super admins can update platform settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update platform settings" ON "AutoSpace".platform_settings FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: user_roles Super admins can update roles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can update roles" ON "AutoSpace".user_roles FOR UPDATE USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: ai_usage_logs Super admins can view all ai usage logs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all ai usage logs" ON "AutoSpace".ai_usage_logs FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: contact_usage Super admins can view all contact usage; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all contact usage" ON "AutoSpace".contact_usage FOR SELECT TO authenticated USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: conversations Super admins can view all conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all conversations" ON "AutoSpace".conversations FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: faqs Super admins can view all faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all faqs" ON "AutoSpace".faqs FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: orders Super admins can view all orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all orders" ON "AutoSpace".orders FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: profiles Super admins can view all profiles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all profiles" ON "AutoSpace".profiles FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: user_wsender_sessions Super admins can view all sessions; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all sessions" ON "AutoSpace".user_wsender_sessions FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: settings Super admins can view all settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all settings" ON "AutoSpace".settings FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: staff_accounts Super admins can view all staff; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view all staff" ON "AutoSpace".staff_accounts FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: platform_settings Super admins can view platform settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins can view platform settings" ON "AutoSpace".platform_settings FOR SELECT USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: leads Super admins view all leads; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Super admins view all leads" ON "AutoSpace".leads FOR SELECT TO authenticated USING ("AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role));
+
+
+--
+-- Name: conversations Users can create own conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own conversations" ON "AutoSpace".conversations FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: faqs Users can create own faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own faqs" ON "AutoSpace".faqs FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: orders Users can create own orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own orders" ON "AutoSpace".orders FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: products Users can create own products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own products" ON "AutoSpace".products FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: user_wsender_sessions Users can create own sessions; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own sessions" ON "AutoSpace".user_wsender_sessions FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: settings Users can create own settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can create own settings" ON "AutoSpace".settings FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: conversations Users can delete own conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own conversations" ON "AutoSpace".conversations FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: faqs Users can delete own faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own faqs" ON "AutoSpace".faqs FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: orders Users can delete own orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own orders" ON "AutoSpace".orders FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: products Users can delete own products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own products" ON "AutoSpace".products FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: user_wsender_sessions Users can delete own sessions; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own sessions" ON "AutoSpace".user_wsender_sessions FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: settings Users can delete own settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own settings" ON "AutoSpace".settings FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: fcm_tokens Users can delete own tokens; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete own tokens" ON "AutoSpace".fcm_tokens FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: chat_takeovers Users can delete their own takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can delete their own takeovers" ON "AutoSpace".chat_takeovers FOR DELETE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: fcm_tokens Users can insert own tokens; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can insert own tokens" ON "AutoSpace".fcm_tokens FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: chat_takeovers Users can insert their own takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can insert their own takeovers" ON "AutoSpace".chat_takeovers FOR INSERT WITH CHECK ((auth.uid() = user_id));
+
+
+--
+-- Name: conversations Users can update own conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own conversations" ON "AutoSpace".conversations FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: faqs Users can update own faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own faqs" ON "AutoSpace".faqs FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: orders Users can update own orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own orders" ON "AutoSpace".orders FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: products Users can update own products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own products" ON "AutoSpace".products FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: user_wsender_sessions Users can update own sessions; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own sessions" ON "AutoSpace".user_wsender_sessions FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: settings Users can update own settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own settings" ON "AutoSpace".settings FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: fcm_tokens Users can update own tokens; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update own tokens" ON "AutoSpace".fcm_tokens FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: profiles Users can update their own profile; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update their own profile" ON "AutoSpace".profiles FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: chat_takeovers Users can update their own takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can update their own takeovers" ON "AutoSpace".chat_takeovers FOR UPDATE USING ((auth.uid() = user_id));
+
+
+--
+-- Name: ai_usage_logs Users can view own ai usage logs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own ai usage logs" ON "AutoSpace".ai_usage_logs FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: contact_usage Users can view own contact usage; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own contact usage" ON "AutoSpace".contact_usage FOR SELECT TO authenticated USING (((auth.uid() = user_id) OR "AutoSpace".is_staff_of(auth.uid(), user_id)));
+
+
+--
+-- Name: conversations Users can view own conversations; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own conversations" ON "AutoSpace".conversations FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: faq_usage_logs Users can view own faq usage logs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own faq usage logs" ON "AutoSpace".faq_usage_logs FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: faqs Users can view own faqs; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own faqs" ON "AutoSpace".faqs FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: orders Users can view own orders; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own orders" ON "AutoSpace".orders FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: products Users can view own products; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own products" ON "AutoSpace".products FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: user_roles Users can view own roles; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own roles" ON "AutoSpace".user_roles FOR SELECT USING (((auth.uid() = user_id) OR "AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role)));
+
+
+--
+-- Name: user_wsender_sessions Users can view own sessions; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own sessions" ON "AutoSpace".user_wsender_sessions FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: settings Users can view own settings; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own settings" ON "AutoSpace".settings FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: fcm_tokens Users can view own tokens; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view own tokens" ON "AutoSpace".fcm_tokens FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: profiles Users can view their own profile; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view their own profile" ON "AutoSpace".profiles FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: chat_takeovers Users can view their own takeovers; Type: POLICY; Schema: AutoSpace; Owner: -
+--
+
+CREATE POLICY "Users can view their own takeovers" ON "AutoSpace".chat_takeovers FOR SELECT USING ((auth.uid() = user_id));
+
+
+--
+-- Name: ai_usage_logs; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".ai_usage_logs ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: chat_takeovers; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".chat_takeovers ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: contact_usage; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".contact_usage ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: conversations; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".conversations ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: faq_usage_logs; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".faq_usage_logs ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: faqs; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".faqs ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: fcm_tokens; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".fcm_tokens ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: leads; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".leads ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: message_queue; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".message_queue ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: orders; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".orders ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: platform_settings; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".platform_settings ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: products; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".products ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: profiles; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".profiles ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: settings; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".settings ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: staff_accounts; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".staff_accounts ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: user_roles; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".user_roles ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: user_wsender_sessions; Type: ROW SECURITY; Schema: AutoSpace; Owner: -
+--
+
+ALTER TABLE "AutoSpace".user_wsender_sessions ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: -
+--
+
+GRANT USAGE ON SCHEMA public TO postgres;
+GRANT USAGE ON SCHEMA public TO anon;
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT USAGE ON SCHEMA public TO service_role;
+
+
+--
+-- Name: FUNCTION can_read_usage(_user_id uuid); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".can_read_usage(_user_id uuid) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".can_read_usage(_user_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".can_read_usage(_user_id uuid) TO service_role;
+
+
+--
+-- Name: FUNCTION enforce_order_limit(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".enforce_order_limit() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".enforce_order_limit() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".enforce_order_limit() TO service_role;
+
+
+--
+-- Name: FUNCTION get_ai_message_usage(_user_id uuid, _since timestamp with time zone); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".get_ai_message_usage(_user_id uuid, _since timestamp with time zone) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".get_ai_message_usage(_user_id uuid, _since timestamp with time zone) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".get_ai_message_usage(_user_id uuid, _since timestamp with time zone) TO service_role;
+
+
+--
+-- Name: FUNCTION get_contact_usage(_user_id uuid, _since timestamp with time zone); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".get_contact_usage(_user_id uuid, _since timestamp with time zone) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".get_contact_usage(_user_id uuid, _since timestamp with time zone) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".get_contact_usage(_user_id uuid, _since timestamp with time zone) TO service_role;
+
+
+--
+-- Name: FUNCTION get_staff_owner_id(_user_id uuid); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".get_staff_owner_id(_user_id uuid) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".get_staff_owner_id(_user_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".get_staff_owner_id(_user_id uuid) TO service_role;
+
+
+--
+-- Name: FUNCTION handle_new_user(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user() TO service_role;
+
+
+--
+-- Name: FUNCTION handle_new_user_role(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_role() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_role() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_role() TO service_role;
+
+
+--
+-- Name: FUNCTION handle_new_user_settings(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_settings() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_settings() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".handle_new_user_settings() TO service_role;
+
+
+--
+-- Name: FUNCTION has_role(_user_id uuid, _role "AutoSpace".app_role); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".has_role(_user_id uuid, _role "AutoSpace".app_role) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".has_role(_user_id uuid, _role "AutoSpace".app_role) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".has_role(_user_id uuid, _role "AutoSpace".app_role) TO service_role;
+
+
+--
+-- Name: FUNCTION is_admin(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".is_admin() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".is_admin() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".is_admin() TO service_role;
+
+
+--
+-- Name: FUNCTION is_staff_of(_staff_user_id uuid, _owner_id uuid); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".is_staff_of(_staff_user_id uuid, _owner_id uuid) TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".is_staff_of(_staff_user_id uuid, _owner_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".is_staff_of(_staff_user_id uuid, _owner_id uuid) TO service_role;
+
+
+--
+-- Name: FUNCTION update_updated_at_column(); Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON FUNCTION "AutoSpace".update_updated_at_column() TO anon;
+GRANT ALL ON FUNCTION "AutoSpace".update_updated_at_column() TO authenticated;
+GRANT ALL ON FUNCTION "AutoSpace".update_updated_at_column() TO service_role;
+
+
+--
+-- Name: TABLE ai_usage_logs; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".ai_usage_logs TO anon;
+GRANT ALL ON TABLE "AutoSpace".ai_usage_logs TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".ai_usage_logs TO service_role;
+
+
+--
+-- Name: TABLE chat_takeovers; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".chat_takeovers TO anon;
+GRANT ALL ON TABLE "AutoSpace".chat_takeovers TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".chat_takeovers TO service_role;
+
+
+--
+-- Name: TABLE contact_usage; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".contact_usage TO anon;
+GRANT ALL ON TABLE "AutoSpace".contact_usage TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".contact_usage TO service_role;
+
+
+--
+-- Name: TABLE conversations; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".conversations TO anon;
+GRANT ALL ON TABLE "AutoSpace".conversations TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".conversations TO service_role;
+
+
+--
+-- Name: TABLE faq_usage_logs; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".faq_usage_logs TO anon;
+GRANT ALL ON TABLE "AutoSpace".faq_usage_logs TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".faq_usage_logs TO service_role;
+
+
+--
+-- Name: TABLE faqs; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".faqs TO anon;
+GRANT ALL ON TABLE "AutoSpace".faqs TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".faqs TO service_role;
+
+
+--
+-- Name: TABLE fcm_tokens; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".fcm_tokens TO anon;
+GRANT ALL ON TABLE "AutoSpace".fcm_tokens TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".fcm_tokens TO service_role;
+
+
+--
+-- Name: TABLE leads; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".leads TO anon;
+GRANT ALL ON TABLE "AutoSpace".leads TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".leads TO service_role;
+
+
+--
+-- Name: TABLE message_queue; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".message_queue TO anon;
+GRANT ALL ON TABLE "AutoSpace".message_queue TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".message_queue TO service_role;
+
+
+--
+-- Name: TABLE orders; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".orders TO anon;
+GRANT ALL ON TABLE "AutoSpace".orders TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".orders TO service_role;
+
+
+--
+-- Name: TABLE platform_settings; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".platform_settings TO anon;
+GRANT ALL ON TABLE "AutoSpace".platform_settings TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".platform_settings TO service_role;
+
+
+--
+-- Name: TABLE products; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".products TO anon;
+GRANT ALL ON TABLE "AutoSpace".products TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".products TO service_role;
+
+
+--
+-- Name: TABLE profiles; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".profiles TO anon;
+GRANT ALL ON TABLE "AutoSpace".profiles TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".profiles TO service_role;
+
+
+--
+-- Name: TABLE settings; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".settings TO anon;
+GRANT ALL ON TABLE "AutoSpace".settings TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".settings TO service_role;
+
+
+--
+-- Name: TABLE staff_accounts; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".staff_accounts TO anon;
+GRANT ALL ON TABLE "AutoSpace".staff_accounts TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".staff_accounts TO service_role;
+
+
+--
+-- Name: TABLE user_roles; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".user_roles TO anon;
+GRANT ALL ON TABLE "AutoSpace".user_roles TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".user_roles TO service_role;
+
+
+--
+-- Name: TABLE user_wsender_sessions; Type: ACL; Schema: AutoSpace; Owner: -
+--
+
+GRANT ALL ON TABLE "AutoSpace".user_wsender_sessions TO anon;
+GRANT ALL ON TABLE "AutoSpace".user_wsender_sessions TO authenticated;
+GRANT ALL ON TABLE "AutoSpace".user_wsender_sessions TO service_role;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR FUNCTIONS; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR FUNCTIONS; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: AutoSpace; Owner: -
+--
+
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+
+
+-- ============================================================================
+-- broadcast_campaigns & broadcast_queue (New Customization Tables)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS "AutoSpace".broadcast_campaigns (
+    id uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    name text DEFAULT 'Promotional Broadcast'::text NOT NULL,
+    title text DEFAULT 'Promotional Broadcast'::text NOT NULL,
+    segment text DEFAULT 'all'::text NOT NULL,
+    audience_filter text DEFAULT 'all'::text NOT NULL,
+    message text,
+    message_template text,
+    media_url text,
+    media_type text,
+    total_recipients integer DEFAULT 0 NOT NULL,
+    total_count integer DEFAULT 0 NOT NULL,
+    sent_count integer DEFAULT 0 NOT NULL,
+    failed_count integer DEFAULT 0 NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL CONSTRAINT broadcast_campaigns_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sending'::text, 'in_progress'::text, 'completed'::text, 'paused'::text, 'cancelled'::text, 'failed'::text]))),
+    delay_seconds integer DEFAULT 10 NOT NULL,
+    delay_seconds_min integer DEFAULT 8 NOT NULL,
+    delay_seconds_max integer DEFAULT 15 NOT NULL,
+    batch_size integer DEFAULT 30 NOT NULL,
+    batch_cooldown_seconds integer DEFAULT 120 NOT NULL,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE "AutoSpace".broadcast_campaigns OWNER TO postgres;
+
+CREATE TABLE IF NOT EXISTS "AutoSpace".broadcast_queue (
+    id uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+    campaign_id uuid NOT NULL REFERENCES "AutoSpace".broadcast_campaigns(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    phone_number text NOT NULL,
+    customer_name text,
+    recipient_name text,
+    status text DEFAULT 'pending'::text NOT NULL CONSTRAINT broadcast_queue_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sending'::text, 'sent'::text, 'failed'::text]))),
+    error_message text,
+    retry_count integer DEFAULT 0 NOT NULL,
+    sent_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE "AutoSpace".broadcast_queue OWNER TO postgres;
+
+CREATE INDEX IF NOT EXISTS idx_autospace_broadcast_campaigns_user_id ON "AutoSpace".broadcast_campaigns USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_autospace_broadcast_queue_campaign_id ON "AutoSpace".broadcast_queue USING btree (campaign_id);
+CREATE INDEX IF NOT EXISTS idx_autospace_broadcast_queue_status ON "AutoSpace".broadcast_queue USING btree (status);
+CREATE INDEX IF NOT EXISTS idx_autospace_broadcast_queue_user_id ON "AutoSpace".broadcast_queue USING btree (user_id);
+
+ALTER TABLE "AutoSpace".broadcast_campaigns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "AutoSpace".broadcast_queue ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can manage own broadcast campaigns" ON "AutoSpace".broadcast_campaigns;
+CREATE POLICY "Users can manage own broadcast campaigns" ON "AutoSpace".broadcast_campaigns
+    FOR ALL USING (auth.uid() = user_id OR "AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role) OR "AutoSpace".is_staff_of(auth.uid(), user_id))
+    WITH CHECK (auth.uid() = user_id OR "AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role) OR "AutoSpace".is_staff_of(auth.uid(), user_id));
+
+DROP POLICY IF EXISTS "Users can manage own broadcast queue" ON "AutoSpace".broadcast_queue;
+CREATE POLICY "Users can manage own broadcast queue" ON "AutoSpace".broadcast_queue
+    FOR ALL USING (auth.uid() = user_id OR "AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role) OR "AutoSpace".is_staff_of(auth.uid(), user_id))
+    WITH CHECK (auth.uid() = user_id OR "AutoSpace".has_role(auth.uid(), 'super_admin'::"AutoSpace".app_role) OR "AutoSpace".is_staff_of(auth.uid(), user_id));
+
+-- ============================================================================
+-- Dedicated Auth Triggers for AutoSpace
+-- ============================================================================
+
+DROP TRIGGER IF EXISTS on_auth_user_created_AutoSpace ON auth.users;
+CREATE TRIGGER on_auth_user_created_AutoSpace
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION "AutoSpace".handle_new_user();
+
+DROP TRIGGER IF EXISTS on_auth_user_created_role_AutoSpace ON auth.users;
+CREATE TRIGGER on_auth_user_created_role_AutoSpace
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION "AutoSpace".handle_new_user_role();
+
+DROP TRIGGER IF EXISTS on_auth_user_created_settings_AutoSpace ON auth.users;
+CREATE TRIGGER on_auth_user_created_settings_AutoSpace
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION "AutoSpace".handle_new_user_settings();
+
+-- ============================================================================
+-- Schema Grants & Default Privileges
+-- ============================================================================
+
+GRANT USAGE, CREATE ON SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+GRANT ALL ON ALL TABLES IN SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+GRANT ALL ON ALL ROUTINES IN SCHEMA "AutoSpace" TO anon, authenticated, service_role, postgres;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON TABLES TO anon, authenticated, service_role, postgres;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role, postgres;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON SEQUENCES TO anon, authenticated, service_role, postgres;
+ALTER DEFAULT PRIVILEGES IN SCHEMA "AutoSpace" GRANT ALL ON ROUTINES TO anon, authenticated, service_role, postgres;
+
+-- ============================================================================
+-- Realtime Publication
+-- ============================================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables 
+    WHERE pubname = 'supabase_realtime' 
+      AND schemaname = 'AutoSpace' 
+      AND tablename = 'conversations'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE "AutoSpace".conversations;
+  END IF;
+END $$;
+ALTER TABLE "AutoSpace".conversations REPLICA IDENTITY FULL;
+
+-- ============================================================================
+-- Platform Settings Seed
+-- ============================================================================
+
+INSERT INTO "AutoSpace".platform_settings (key, value)
+VALUES (
+  'plan_limits',
+  '{
+    "free":       {"max_products": 5,   "max_faqs": 10,  "max_orders_per_month": 50,   "contacts_per_month": 50,   "ai_messages_per_month": 100,   "max_images_per_product": 1,  "max_staff": 0},
+    "pro":        {"max_products": 50,  "max_faqs": 100, "max_orders_per_month": 500,  "contacts_per_month": 300,  "ai_messages_per_month": 2000,  "max_images_per_product": 5,  "max_staff": 0},
+    "enterprise": {"max_products": 999, "max_faqs": 999, "max_orders_per_month": 9999, "contacts_per_month": 1500, "ai_messages_per_month": 99999, "max_images_per_product": 10, "max_staff": 2}
+  }'::jsonb
+)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+-- ============================================================================
+-- Super Admin Account (Isolated Credentials)
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+DO $$
+DECLARE
+  new_user_id uuid := gen_random_uuid();
+  enc_pw text := crypt('kftjgVqo71tkLP', gen_salt('bf'));
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM auth.users WHERE email = 'superadmin-autospace@buildstart.io') THEN
+    INSERT INTO auth.users (
+      instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, 
+      recovery_sent_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, 
+      created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000000', new_user_id, 'authenticated', 'authenticated', 
+      'superadmin-autospace@buildstart.io', enc_pw, now(), now(), now(), 
+      '{"provider":"email","providers":["email"]}', '{"full_name":"AutoSpace Super Admin"}', 
+      now(), now(), '', '', '', ''
+    );
+  ELSE
+    SELECT id INTO new_user_id FROM auth.users WHERE email = 'superadmin-autospace@buildstart.io';
+    UPDATE auth.users SET encrypted_password = enc_pw WHERE id = new_user_id;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM auth.identities WHERE user_id = new_user_id AND provider = 'email') THEN
+    INSERT INTO auth.identities (
+      id, provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at
+    ) VALUES (
+      gen_random_uuid(),
+      new_user_id::text,
+      new_user_id,
+      jsonb_build_object('sub', new_user_id::text, 'email', 'superadmin-autospace@buildstart.io', 'email_verified', true, 'phone_verified', false),
+      'email',
+      now(),
+      now(),
+      now()
+    );
+  END IF;
+
+  INSERT INTO "AutoSpace".profiles (id, user_id, email, full_name, plan_tier, billing_cycle_start, is_active)
+  VALUES (gen_random_uuid(), new_user_id, 'superadmin-autospace@buildstart.io', 'AutoSpace Super Admin', 'enterprise', now(), true)
+  ON CONFLICT (user_id) DO UPDATE SET 
+    full_name = EXCLUDED.full_name,
+    plan_tier = EXCLUDED.plan_tier,
+    is_active = true;
+
+  INSERT INTO "AutoSpace".user_roles (user_id, role)
+  VALUES (new_user_id, 'super_admin'::"AutoSpace".app_role)
+  ON CONFLICT (user_id, role) DO UPDATE SET role = 'super_admin'::"AutoSpace".app_role;
+  UPDATE "AutoSpace".user_roles SET role = 'super_admin'::"AutoSpace".app_role WHERE user_id = new_user_id;
+
+  INSERT INTO "AutoSpace".staff_accounts (
+    owner_id, staff_user_id, is_active, staff_email, staff_name
+  ) VALUES (
+    new_user_id, new_user_id, true, 'superadmin-autospace@buildstart.io', 'AutoSpace Super Admin'
+  ) ON CONFLICT DO NOTHING;
+
+  INSERT INTO "AutoSpace".settings (user_id, key, value) VALUES
+    (new_user_id, 'welcome_message', '{"text": "Welcome to AutoSpace!"}'::jsonb),
+    (new_user_id, 'payment_info',    '{"accounts": []}'::jsonb),
+    (new_user_id, 'auto_responses',  '{"enabled": true}'::jsonb)
+  ON CONFLICT (user_id, key) DO NOTHING;
+END;
+$$;
+
+-- ============================================================================
+-- Cron Jobs
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'drain-message-queue-AutoSpace') THEN
+    PERFORM cron.unschedule('drain-message-queue-AutoSpace');
+  END IF;
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'send-followups-AutoSpace') THEN
+    PERFORM cron.unschedule('send-followups-AutoSpace');
+  END IF;
+END $$;
+
+SELECT cron.schedule(
+  'drain-message-queue-AutoSpace',
+  '* * * * *',
+  $$
+  SELECT net.http_post(
+    url     := 'http://api-gw:8000/functions/v1/process-message-AutoSpace_Customization',
+    headers := '{"Content-Type":"application/json","Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3ODY0NDc4NjYsImV4cCI6MjEwMTgwNzg2Nn0.X3SLU9ShCNBzlwY91D1CVoHsLHOfYOv6R6eJ8UpkhsQ"}'::jsonb,
+    body    := '{"trigger":"cron"}'::jsonb
+  );
+  $$
+);
+
+SELECT cron.schedule(
+  'send-followups-AutoSpace',
+  '*/5 * * * *',
+  $$
+  SELECT net.http_post(
+    url     := 'http://api-gw:8000/functions/v1/send-followups-AutoSpace_Customization',
+    headers := '{"Content-Type":"application/json","Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3ODY0NDc4NjYsImV4cCI6MjEwMTgwNzg2Nn0.X3SLU9ShCNBzlwY91D1CVoHsLHOfYOv6R6eJ8UpkhsQ"}'::jsonb,
+    body    := '{}'::jsonb
+  );
+  $$
+);
