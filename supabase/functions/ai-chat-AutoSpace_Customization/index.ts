@@ -203,7 +203,12 @@ serve(async (req) => {
     const freeDeliveryThreshold = deliverySettings.free_delivery_threshold || 0;
 
     const productCatalog = products.map(p => {
-      let line = `- ${p.name}: Base price LKR ${p.price} (${p.product_type})`;
+      let line = "";
+      if (p.price && Number(p.price) > 0) {
+        line = `- ${p.name}: Base price LKR ${p.price} (${p.product_type})`;
+      } else {
+        line = `- ${p.name} (${p.product_type})`;
+      }
       if (p.product_type === "physical" && p.delivery_price && p.delivery_price > 0) {
         line += ` | Delivery fee: LKR ${p.delivery_price}`;
       }
@@ -234,6 +239,8 @@ serve(async (req) => {
           return `${v.name}: ${opts}`;
         }).join("; ");
         line += ` | Variations: ${varLines}`;
+      } else if (!p.price || Number(p.price) <= 0) {
+        line += ` | Note: Price is quoted based on specific vehicle model and selected options.`;
       }
       return line;
     }).join("\n");
@@ -267,7 +274,7 @@ const systemPrompt = `You are the intelligent WhatsApp AI Assistant for Auto Spa
 CORE OBJECTIVES:
 1. Greet the customer professionally and identify their vehicle (Make, Model, Year).
 2. Answer inquiries about vehicle modifications, upgrades, and styling across an unlimited catalogue.
-3. Provide comprehensive, client-approved details, specifications, estimated workshop duration (~4–6 hours), and approved prices (in LKR).
+3. Provide comprehensive, client-approved details, specifications, estimated workshop duration (~4–6 hours), and approved prices (in LKR). If a product does not have a fixed base price or depends on variations, do NOT state 0 LKR; explain that pricing is customized based on their vehicle model, year, and chosen options.
 4. Send vehicle modification photos/visuals using <IMAGE_URL>url</IMAGE_URL> tags at the end of your response.
 5. Inquire about the customer's convenient date and time to bring their vehicle to the workshop.
 6. Collect customer lead details: Full Name, Contact Number, Vehicle Details & Registration Number (e.g. CAB-4590).
