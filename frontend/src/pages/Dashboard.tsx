@@ -23,7 +23,7 @@ export default function Dashboard() {
     const fetchStats = async () => {
       try {
         const [pendingRes, recentRes] = await Promise.all([
-          supabase.from("orders").select("id", { count: "exact", head: true }).eq("status", "pending"),
+          supabase.from("orders").select("id", { count: "exact", head: true }).in("status", ["pending", "allocated"]),
           supabase.from("orders").select("*").order("created_at", { ascending: false }).limit(5),
         ]);
         setStats({
@@ -147,35 +147,35 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Pending Orders Alert */}
+        {/* Upcoming Time Slots Alert */}
         {stats.pendingOrders > 0 && (
-          <Card className="border-orange-200 bg-orange-50 dark:bg-orange-950/20">
+          <Card className="border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20">
             <CardHeader className="flex flex-row items-center gap-4 pb-2">
-              <Clock className="h-5 w-5 text-orange-500" />
+              <Clock className="h-5 w-5 text-emerald-600" />
               <div>
-                <CardTitle className="text-lg">Pending Orders</CardTitle>
+                <CardTitle className="text-lg">Upcoming Time Slots</CardTitle>
                 <CardDescription>
-                  You have {stats.pendingOrders} order{stats.pendingOrders > 1 ? "s" : ""} waiting to be processed
+                  You have {stats.pendingOrders} workshop appointment{stats.pendingOrders > 1 ? "s" : ""} booked and allocated
                 </CardDescription>
               </div>
             </CardHeader>
           </Card>
         )}
 
-        {/* Recent Orders */}
+        {/* Recent Appointments */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <TrendingUp className="h-5 w-5" />
-              Recent Orders
+              <CalendarDays className="h-5 w-5 text-primary" />
+              Recent Appointments & Bookings
             </CardTitle>
-            <CardDescription>Latest orders from your WhatsApp customers</CardDescription>
+            <CardDescription>Latest vehicle modification bookings from WhatsApp leads</CardDescription>
           </CardHeader>
           <CardContent>
             {loading ? (
               <p className="text-muted-foreground">Loading...</p>
             ) : stats.recentOrders.length === 0 ? (
-              <p className="text-muted-foreground">No orders yet. Orders will appear here once customers start ordering via WhatsApp.</p>
+              <p className="text-muted-foreground">No appointments yet. Bookings will appear here once customers confirm their time slot via WhatsApp.</p>
             ) : (
               <div className="space-y-4">
                 {stats.recentOrders.map((order) => (
@@ -184,15 +184,20 @@ export default function Dashboard() {
                     className="flex flex-col sm:flex-row sm:items-center justify-between p-3 sm:p-4 rounded-lg border gap-2"
                   >
                     <div>
-                      <p className="font-medium text-sm sm:text-base">{order.customer_name}</p>
-                      <p className="text-xs sm:text-sm text-muted-foreground">{order.customer_phone}</p>
+                      <p className="font-semibold text-sm sm:text-base">{order.customer_name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {order.customer_phone}
+                        {order.vehicle_details ? ` · 🚗 ${order.vehicle_details}` : ""}
+                        {order.service_requested ? ` · 🔧 ${order.service_requested}` : ""}
+                      </p>
                     </div>
                     <div className="flex items-center justify-between sm:text-right gap-2">
-                      <p className="font-medium text-sm sm:text-base">LKR {order.total_amount}</p>
+                      <p className="font-medium text-sm sm:text-base">LKR {order.total_amount ? order.total_amount.toLocaleString() : "0"}</p>
                       <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
-                        order.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
-                        order.status === 'processing' ? 'bg-blue-100 text-blue-800' :
-                        order.status === 'delivered' ? 'bg-green-100 text-green-800' :
+                        order.status === 'allocated' ? 'bg-emerald-100 text-emerald-800' :
+                        order.status === 'checked_in' ? 'bg-blue-100 text-blue-800' :
+                        order.status === 'completed' ? 'bg-green-100 text-green-800' :
+                        order.status === 'rescheduled' ? 'bg-amber-100 text-amber-800' :
                         'bg-gray-100 text-gray-800'
                       }`}>
                         {order.status}

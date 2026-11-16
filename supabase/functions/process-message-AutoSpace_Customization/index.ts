@@ -14,7 +14,9 @@ serve(async (req) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+    db: { schema: "AutoSpace" },
+  });
 
   let triggerSource = "cron";
   let triggerCorrelationId = "";
@@ -248,12 +250,17 @@ async function processMessage(
   }
 
   // 3. Check if chat is taken over
+  const altPhone = phoneNumber.startsWith("94")
+    ? "0" + phoneNumber.slice(2)
+    : (phoneNumber.startsWith("0") ? "94" + phoneNumber.slice(1) : phoneNumber);
+
   const { data: takeoverData } = await supabase
     .from("chat_takeovers")
     .select("is_taken_over")
     .eq("user_id", userId)
-    .eq("phone_number", phoneNumber)
+    .or(`phone_number.eq.${phoneNumber},phone_number.eq.${altPhone}`)
     .eq("is_taken_over", true)
+    .limit(1)
     .maybeSingle();
 
   if (takeoverData) {
@@ -292,8 +299,9 @@ async function processMessage(
   const aiTimeout = setTimeout(() => controller.abort(), 55_000); // 55s timeout (edge function limit ~60s)
 
   let aiResponse: Response;
+  const aiChatFunction = Deno.env.get("AI_CHAT_FUNCTION_NAME") || "ai-chat-AutoSpace_Customization";
   try {
-    aiResponse = await fetch(`${supabaseUrl}/functions/v1/ai-chat`, {
+    aiResponse = await fetch(`${supabaseUrl}/functions/v1/${aiChatFunction}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${supabaseServiceKey}`,
@@ -496,7 +504,7 @@ async function sendWhatsApp(
   const body: any = { to, message, sessionApiKey };
   if (imageUrl) body.imageUrl = imageUrl;
 
-  const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp`, {
+  const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp-AutoSpace_Customization`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${supabaseServiceKey}`,
@@ -521,7 +529,7 @@ async function sendWhatsAppMedia(
   mediaUrl: string,
   sessionApiKey: string
 ) {
-  const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp`, {
+  const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp-AutoSpace_Customization`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${supabaseServiceKey}`,
@@ -700,7 +708,7 @@ async function maybeNotifyQualifiedLead(
       sendApiKey = sessionData?.session_api_key || null;
     }
 
-    const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp`, {
+    const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp-AutoSpace_Customization`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${supabaseServiceKey}`,

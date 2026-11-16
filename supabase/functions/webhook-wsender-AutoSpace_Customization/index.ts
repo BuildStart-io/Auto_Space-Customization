@@ -27,7 +27,9 @@ serve(async (req) => {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+    db: { schema: "AutoSpace" },
+  });
 
   const correlationId = crypto.randomUUID();
 
@@ -63,13 +65,152 @@ serve(async (req) => {
       return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders });
     }
 
-    if (event !== "message" && event !== "message.any") {
-      console.log(`[${correlationId}] Ignoring event: ${event}`);
+    // Accept:
+    // 1) "message" (inbound customer messages where fromMe !== true)
+    // 2) "message.any" or "message" ONLY IF fromMe === true (outbound staff messages from the WhatsApp app)
+    const isOutboundStaffMsg = (event === "message.any" || event === "message") && wp?.fromMe === true;
+    const isInboundCustomerMsg = event === "message" && wp?.fromMe !== true;
+
+    if (!isOutboundStaffMsg && !isInboundCustomerMsg) {
+      console.log(`[${correlationId}] Ignoring event: ${event} (fromMe: ${wp?.fromMe})`);
       return new Response(JSON.stringify({ ok: true, skipped: event }), { headers: jsonHeaders });
     }
 
     if (wp?.fromMe === true) {
-      return new Response(JSON.stringify({ ok: true, skipped: "fromMe" }), { headers: jsonHeaders });
+      // 1. Extract recipient (customer) phone number from wp.to or remoteJid
+      const toJid = String(wp.to || wp._data?.key?.remoteJid || "");
+      if (/@g\.us$/i.test(toJid) || /@broadcast$/i.test(toJid) || /@newsletter$/i.test(toJid)) {
+        return new Response(JSON.stringify({ ok: true, skipped: "fromMe_group" }), { headers: jsonHeaders });
+      }
+
+      let customerPhone = extractPhoneFromJid(toJid);
+      if (/@lid$/i.test(toJid)) {
+        const wahaBase = (Deno.env.get("WAHA_BASE_URL") || "").replace(/\/+$/, "");
+        const wahaKey = Deno.env.get("WAHA_API_KEY") || "";
+        try {
+          const lidRes = await fetch(`${wahaBase}/api/${encodeURIComponent(sessionName)}/lids/${encodeURIComponent(toJid)}`, {
+            headers: { "X-Api-Key": wahaKey, Accept: "application/json" },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (lidRes.ok) {
+            const lidData = await lidRes.json();
+            customerPhone = extractPhoneFromJid(lidData?.pn || "");
+          }
+        } catch (_err) {
+          // ignore lid error
+        }
+        if (!customerPhone) customerPhone = toJid;
+      }
+
+      const outText = (wp.body
+        || wp._data?.message?.conversation
+        || wp._data?.message?.extendedTextMessage?.text
+        || "").trim();
+
+      const outTextLower = outText.toLowerCase();
+      const cleanText = outTextLower.replace(/[^\w\s#]/g, "").trim();
+
+      const isTakeover =
+        cleanText === "takeover" ||
+        cleanText === "take over" ||
+        outTextLower.includes("#takeover") ||
+        outTextLower.includes("#take_over") ||
+        cleanText.startsWith("takeover") ||
+        cleanText.startsWith("take over");
+
+      const isResume =
+        cleanText === "resume" ||
+        outTextLower.includes("#resume") ||
+        cleanText.startsWith("resume");
+
+      // Check for Takeover Trigger Keyword
+      if (isTakeover) {
+        console.log(`[${correlationId}] WhatsApp keyword takeover triggered by staff for ${customerPhone}`);
+        if (userId && customerPhone) {
+          const phonesToMark = [customerPhone];
+          if (customerPhone.startsWith("94") && customerPhone.length === 11) {
+            phonesToMark.push("0" + customerPhone.slice(2));
+          } else if (customerPhone.startsWith("0") && customerPhone.length === 10) {
+            phonesToMark.push("94" + customerPhone.slice(1));
+          }
+
+          for (const p of phonesToMark) {
+            await supabase
+              .from("chat_takeovers")
+              .upsert(
+                {
+                  user_id: userId,
+                  phone_number: p,
+                  is_taken_over: true,
+                  updated_at: new Date().toISOString(),
+                },
+                { onConflict: "user_id,phone_number" }
+              );
+          }
+
+          await supabase.from("conversations").insert({
+            user_id: userId,
+            phone_number: customerPhone,
+            message: outText || "🔑 Staff triggered WhatsApp Takeover (#TAKEOVER)",
+            direction: "outbound",
+            message_type: "text",
+            metadata: { takeover_event: true, keyword: "#TAKEOVER", correlationId },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true, takeover: true, phone: customerPhone }), { headers: jsonHeaders });
+      }
+
+      // Check for Resume Trigger Keyword
+      if (isResume) {
+        console.log(`[${correlationId}] WhatsApp keyword takeover RESUMED by staff for ${customerPhone}`);
+        if (userId && customerPhone) {
+          const phonesToResume = [customerPhone];
+          if (customerPhone.startsWith("94") && customerPhone.length === 11) {
+            phonesToResume.push("0" + customerPhone.slice(2));
+          } else if (customerPhone.startsWith("0") && customerPhone.length === 10) {
+            phonesToResume.push("94" + customerPhone.slice(1));
+          }
+
+          for (const p of phonesToResume) {
+            await supabase
+              .from("chat_takeovers")
+              .upsert(
+                {
+                  user_id: userId,
+                  phone_number: p,
+                  is_taken_over: false,
+                  updated_at: new Date().toISOString(),
+                },
+                { onConflict: "user_id,phone_number" }
+              );
+          }
+
+          await supabase.from("conversations").insert({
+            user_id: userId,
+            phone_number: customerPhone,
+            message: outText || "▶️ AI Chatbot resumed by staff (#RESUME)",
+            direction: "outbound",
+            message_type: "text",
+            metadata: { resume_event: true, keyword: "#RESUME", correlationId },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true, resume: true, phone: customerPhone }), { headers: jsonHeaders });
+      }
+
+      // If it is a normal staff message sent directly from WhatsApp:
+      // Store in conversations so dashboard has full history
+      if (userId && customerPhone && outText) {
+        await supabase.from("conversations").insert({
+          user_id: userId,
+          phone_number: customerPhone,
+          message: outText,
+          direction: "outbound",
+          message_type: "text",
+          metadata: { staff_device: true, correlationId },
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true, skipped: "fromMe_handled" }), { headers: jsonHeaders });
     }
 
     const fromJid = String(wp.from || wp._data?.key?.remoteJid || "");
@@ -172,7 +313,7 @@ serve(async (req) => {
     }
 
     // Fire-and-forget trigger process-message (cron is the safety net)
-    fetch(`${supabaseUrl}/functions/v1/process-message`, {
+    fetch(`${supabaseUrl}/functions/v1/process-message-AutoSpace_Customization`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

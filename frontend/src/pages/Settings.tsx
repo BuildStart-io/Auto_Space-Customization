@@ -100,7 +100,7 @@ export default function Settings() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [_settingWebhook, setSettingWebhook] = useState<string | null>(null);
 
-  const webhookUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-wsender`;
+  const webhookUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/webhook-wsender-AutoSpace_Customization`;
 
   const getFunctionAuthHeaders = useCallback(async (includeJson = false) => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -224,7 +224,7 @@ export default function Settings() {
 
       // Fetch all sessions from Wasender API then filter to only user's
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions?action=list-sessions`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization?action=list-sessions`,
         {
           headers: await getFunctionAuthHeaders(),
         }
@@ -258,7 +258,7 @@ export default function Settings() {
     setQrCode(null);
     setQrImage(null);
     setSelectedSessionId(sessionId);
-    const baseUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions`;
+    const baseUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization`;
 
     try {
       const authHeaders = await getFunctionAuthHeaders();
@@ -312,7 +312,7 @@ export default function Settings() {
     setCreatingSession(true);
     try {
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions?action=create-session`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization?action=create-session`,
         {
           method: "POST",
           headers: await getFunctionAuthHeaders(true),
@@ -340,7 +340,7 @@ export default function Settings() {
         let sessionApiKey: string | null = null;
         try {
           const detailsRes = await fetch(
-            `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions?action=session-details&sessionId=${newSession.id}`,
+            `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization?action=session-details&sessionId=${newSession.id}`,
             { headers: await getFunctionAuthHeaders() }
           );
           if (detailsRes.ok) {
@@ -377,7 +377,7 @@ export default function Settings() {
     setSettingWebhook(sessionId);
     try {
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions?action=set-webhook&sessionId=${sessionId}`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization?action=set-webhook&sessionId=${sessionId}`,
         {
           method: "POST",
           headers: await getFunctionAuthHeaders(true),
@@ -404,7 +404,7 @@ export default function Settings() {
     setDeletingSessionId(sessionId);
     try {
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions?action=delete-session&sessionId=${sessionId}`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/wsender-sessions-AutoSpace_Customization?action=delete-session&sessionId=${sessionId}`,
         {
           method: "DELETE",
           headers: await getFunctionAuthHeaders(),
@@ -644,9 +644,7 @@ export default function Settings() {
         <Tabs defaultValue="whatsapp" className="space-y-6">
           <TabsList className="w-full sm:w-auto">
             <TabsTrigger value="whatsapp" className="flex-1 sm:flex-initial">WhatsApp</TabsTrigger>
-            <TabsTrigger value="chatbot" className="flex-1 sm:flex-initial">Chatbot</TabsTrigger>
-            <TabsTrigger value="payment" className="flex-1 sm:flex-initial">Payment</TabsTrigger>
-            <TabsTrigger value="delivery" className="flex-1 sm:flex-initial">Delivery</TabsTrigger>
+            <TabsTrigger value="chatbot" className="flex-1 sm:flex-initial">Chatbot & Appointments</TabsTrigger>
             <TabsTrigger value="staff" className="flex-1 sm:flex-initial">Staff</TabsTrigger>
           </TabsList>
 

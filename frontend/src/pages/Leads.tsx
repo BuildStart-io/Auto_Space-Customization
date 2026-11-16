@@ -18,8 +18,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { MessageSquare, Sparkles, Lock, Users, Search } from "lucide-react";
+import { MessageSquare, Sparkles, Lock, Users, Search, Clock, Car, Wrench } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { format } from "date-fns";
 
 export const LEAD_STATUSES = [
   { value: "new", label: "New" },
@@ -48,6 +49,10 @@ interface LeadRow {
   inbound_count: number;
   has_order: boolean;
   last_time: string | null;
+  vehicle_details?: string | null;
+  service_requested?: string | null;
+  allocated_slot?: string | null;
+  slot_status?: string | null;
 }
 
 export default function Leads() {
@@ -86,7 +91,7 @@ export default function Leads() {
           .eq("user_id", effectiveUserId),
         supabase
           .from("leads" as any)
-          .select("id, phone_number, customer_name, assigned_to, status")
+          .select("id, phone_number, customer_name, assigned_to, status, vehicle_details, service_requested, allocated_slot, slot_status")
           .eq("user_id", effectiveUserId),
         supabase
           .from("staff_accounts")
@@ -165,6 +170,10 @@ export default function Leads() {
           inbound_count: s?.inbound || 0,
           has_order: orderPhones.has(phone),
           last_time: s?.last || null,
+          vehicle_details: l?.vehicle_details || null,
+          service_requested: l?.service_requested || null,
+          allocated_slot: l?.allocated_slot || null,
+          slot_status: l?.slot_status || (l?.allocated_slot ? "allocated" : null),
         };
       });
 
@@ -263,7 +272,7 @@ export default function Leads() {
       const displayPhone = String(row.phone_number || "").split("@")[0];
       const message = `👤 NEW CUSTOMER ASSIGNED\n\nName: ${row.customer_name || "Unknown"}\nContact: ${displayPhone}\n\nPlease follow up with this customer.`;
 
-      await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-whatsapp`, {
+      await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-whatsapp-AutoSpace_Customization`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
@@ -475,16 +484,47 @@ export default function Leads() {
                               Qualified
                             </Badge>
                           )}
-                          {row.has_order && (
+                          {row.allocated_slot && (
+                            <Badge className="text-[10px] bg-emerald-600 hover:bg-emerald-700 text-white font-medium flex items-center gap-1">
+                              <Clock className="h-3 w-3" />
+                              Slot: {(() => {
+                                try {
+                                  const d = new Date(row.allocated_slot);
+                                  if (!isNaN(d.getTime())) return format(d, "MMM d, h:mm a");
+                                } catch {}
+                                return row.allocated_slot.replace("T", " ").slice(0, 16);
+                              })()}
+                            </Badge>
+                          )}
+                          {row.slot_status && (
+                            <Badge variant="outline" className="text-[10px] uppercase font-semibold text-emerald-700 border-emerald-300 bg-emerald-50">
+                              {row.slot_status.replace("_", " ")}
+                            </Badge>
+                          )}
+                          {row.has_order && !row.allocated_slot && (
                             <Badge variant="secondary" className="text-[10px]">
                               Ordered
                             </Badge>
                           )}
                         </div>
-                        <p className="text-sm text-muted-foreground">
-                          {row.phone_number} · {row.inbound_count} message
-                          {row.inbound_count === 1 ? "" : "s"}
-                        </p>
+                        <div className="flex items-center gap-2 flex-wrap mt-1">
+                          <p className="text-sm text-muted-foreground">
+                            {row.phone_number} · {row.inbound_count} message
+                            {row.inbound_count === 1 ? "" : "s"}
+                          </p>
+                          {row.vehicle_details && (
+                            <span className="inline-flex items-center gap-1 text-xs bg-muted px-2 py-0.5 rounded font-medium text-foreground">
+                              <Car className="h-3 w-3 text-primary" />
+                              {row.vehicle_details}
+                            </span>
+                          )}
+                          {row.service_requested && (
+                            <span className="inline-flex items-center gap-1 text-xs bg-muted px-2 py-0.5 rounded font-medium text-foreground">
+                              <Wrench className="h-3 w-3 text-primary" />
+                              {row.service_requested}
+                            </span>
+                          )}
+                        </div>
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">

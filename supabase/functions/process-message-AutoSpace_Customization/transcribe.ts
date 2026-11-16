@@ -58,7 +58,7 @@ export async function transcribeAudio(sessionName: string, wahaMessageId: string
             content: [
               {
                 type: "text",
-                text: "Transcribe this audio verbatim in its native language/script (Sinhala, Tamil, English, or Singlish). Do NOT translate or summarize. Output ONLY the transcription."
+                text: "Transcribe this audio verbatim in its native language/script (Sinhala, Tamil, English, Singlish, or Tanglish). Accurately transcribe automotive terminology (vehicle makes, models, body kits, face-lifts, ambient lighting, modifications, and part names). Do NOT translate or summarize. Output ONLY the transcription."
               },
               {
                 type: "image_url",

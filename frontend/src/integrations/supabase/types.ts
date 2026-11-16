@@ -12,7 +12,7 @@ export type Database = {
   __InternalSupabase: {
     PostgrestVersion: "14.15"
   }
-  public: {
+  AutoSpace: {
     Tables: {
       ai_usage_logs: {
         Row: {
@@ -238,6 +238,10 @@ export type Database = {
           status: string
           updated_at: string
           user_id: string
+          vehicle_details: string | null
+          service_requested: string | null
+          allocated_slot: string | null
+          slot_status: string | null
         }
         Insert: {
           assigned_to?: string | null
@@ -248,6 +252,10 @@ export type Database = {
           status?: string
           updated_at?: string
           user_id: string
+          vehicle_details?: string | null
+          service_requested?: string | null
+          allocated_slot?: string | null
+          slot_status?: string | null
         }
         Update: {
           assigned_to?: string | null
@@ -258,6 +266,10 @@ export type Database = {
           status?: string
           updated_at?: string
           user_id?: string
+          vehicle_details?: string | null
+          service_requested?: string | null
+          allocated_slot?: string | null
+          slot_status?: string | null
         }
         Relationships: []
       }
@@ -337,6 +349,9 @@ export type Database = {
           updated_at: string
           user_id: string
           whatsapp_phone: string | null
+          vehicle_details: string | null
+          service_requested: string | null
+          allocated_slot: string | null
         }
         Insert: {
           created_at?: string
@@ -353,6 +368,9 @@ export type Database = {
           updated_at?: string
           user_id: string
           whatsapp_phone?: string | null
+          vehicle_details?: string | null
+          service_requested?: string | null
+          allocated_slot?: string | null
         }
         Update: {
           created_at?: string
@@ -369,6 +387,9 @@ export type Database = {
           updated_at?: string
           user_id?: string
           whatsapp_phone?: string | null
+          vehicle_details?: string | null
+          service_requested?: string | null
+          allocated_slot?: string | null
         }
         Relationships: []
       }
@@ -667,7 +688,7 @@ export type Database = {
 
 type DatabaseWithoutInternals = Omit<Database, "__InternalSupabase">
 
-type DefaultSchema = DatabaseWithoutInternals[Extract<keyof Database, "public">]
+type DefaultSchema = DatabaseWithoutInternals[Extract<keyof Database, "AutoSpace">]
 
 export type Tables<
   DefaultSchemaTableNameOrOptions extends
@@ -783,7 +804,7 @@ export type CompositeTypes<
     : never
 
 export const Constants = {
-  public: {
+  AutoSpace: {
     Enums: {
       app_role: ["super_admin", "business_user"],
       plan_tier: ["free", "pro", "enterprise"],

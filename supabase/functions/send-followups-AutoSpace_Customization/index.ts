@@ -58,7 +58,9 @@ Deno.serve(async (req) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const supabase = createClient(supabaseUrl, serviceKey);
+  const supabase = createClient(supabaseUrl, serviceKey, {
+    db: { schema: "AutoSpace" },
+  });
 
   const summary: Record<string, unknown>[] = [];
 
@@ -207,7 +209,18 @@ Deno.serve(async (req) => {
           break;
         }
 
-        if (orderKeys.has(key)) continue; // customer already ordered — never send
+        if (orderKeys.has(key)) continue; // customer already ordered / booked — never send
+
+        // Skip if customer already has an allocated time slot in leads table
+        const { data: leadSlot } = await supabase
+          .from("leads")
+          .select("allocated_slot")
+          .eq("user_id", userId)
+          .in("phone_number", [entry.phone, key])
+          .not("allocated_slot", "is", null)
+          .limit(1)
+          .maybeSingle();
+        if (leadSlot?.allocated_slot) continue;
 
         // Skip if the chat has been taken over by a human
         const { data: takeover } = await supabase
@@ -239,7 +252,7 @@ Deno.serve(async (req) => {
         }
 
         try {
-          const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp`, {
+          const res = await fetch(`${supabaseUrl}/functions/v1/send-whatsapp-AutoSpace_Customization`, {
             method: "POST",
             headers: {
               Authorization: `Bearer ${serviceKey}`,
