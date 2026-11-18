@@ -203,7 +203,7 @@ serve(async (req) => {
     const customerExplicitlyAskedForPhotos =
       /\b(photo|photos|picture|pictures|image|images|pic|pics|poto|sample|samples|show|pennanna|evanna|ewanna|balanna|kaatunga|katunga|anupunga|anuppunga|padam)\b|පින්තූර|ෆොටෝ|படம்|போட்டோ/i.test(trimmedInputMsg);
     const customerExplicitlyAskedForVideo =
-      /\b(video|videos|clip|vdio|vidio|pennanna|evanna|ewanna|kaatunga|anupunga)\b|වීඩියෝ|வீடியோ/i.test(trimmedInputMsg);
+      /\b(video|videos|clip|vdio|vidio)\b|වීඩියෝ|வீடியோ/i.test(trimmedInputMsg);
 
     // Fix 1: Active Session Time Window (6 hours) — returning customers after 6 hours get fresh photos
     const sessionWindowStart = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
