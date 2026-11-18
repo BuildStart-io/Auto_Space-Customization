@@ -728,49 +728,10 @@ CRITICAL SECURITY RULE:
     }
 
     // ------------------------------------------------------------------
-    // 3-Layer Deterministic Product Media Controller (UUID-Based)
-    // 1. Product Exists & Has Media Check
-    // 2. Vehicle Model Compatibility Check (prevents cross-model leakage e.g. sending Raize photos to Alto customer)
-    // 3. Already-Sent Deduplication Check (prevents repeating photos on follow-up questions)
+    // Deterministic Product Media Controller (UUID-Based, No String Search)
+    // 1. Product Exists & Has Media Check (by exact PRODUCT_ID selected by Gemini)
+    // 2. 6-Hour Session Deduplication + Post-Order Reset + Explicit Photo Override
     // ------------------------------------------------------------------
-    const KNOWN_VEHICLE_MODELS = [
-      "raize", "hilux", "rocco", "revo", "prius", "aqua", "axio", "premio", "allion", "vitz", "yaris",
-      "chr", "c-hr", "prado", "land cruiser", "landcruiser", "harrier", "vellfire", "alphard", "noah", "voxy", "kdh", "hiace",
-      "alto", "wagon r", "wagonr", "swift", "spacia", "every", "hustler", "jimny", "baleno", "celerio", "ertiga", "vitara",
-      "civic", "vezel", "fit", "grace", "shuttle", "crv", "cr-v", "insight", "freed", "n-box", "nbox",
-      "defender", "range rover", "discovery", "montero", "pajero", "outlander", "l200", "triton", "lancer",
-      "sunny", "leaf", "x-trail", "xtrail", "navara", "dayz", "march", "sylphy",
-      "bmw", "audi", "benz", "mercedes", "mazda", "axela", "demio", "cx-5", "cx5", "ford", "ranger", "raptor"
-    ];
-
-    const recentInboundText = [
-      trimmedMessage,
-      ...((conversationHistory || []) as ConversationMessage[])
-        .filter((m) => m.direction === "inbound")
-        .slice(-3)
-        .map((m) => m.message || ""),
-    ].join(" ").toLowerCase();
-
-    const currentMsgLower = trimmedMessage.toLowerCase();
-    const customerCurrentModels = KNOWN_VEHICLE_MODELS.filter((m) => currentMsgLower.includes(m));
-    const customerRecentModels = KNOWN_VEHICLE_MODELS.filter((m) => recentInboundText.includes(m));
-
-    function isProductModelCompatible(prodName: string): boolean {
-      const pLower = String(prodName || "").toLowerCase();
-      const prodModels = KNOWN_VEHICLE_MODELS.filter((m) => pLower.includes(m));
-      // Generic products (no vehicle model in name, e.g. "3D carpets", "Android players") are compatible with any vehicle
-      if (prodModels.length === 0) return true;
-      // Model-specific product (e.g. "Raize Custom seat cover"):
-      if (customerCurrentModels.length > 0) {
-        return prodModels.some((pm) => customerCurrentModels.includes(pm));
-      }
-      if (customerRecentModels.length > 0) {
-        return prodModels.some((pm) => customerRecentModels.includes(pm));
-      }
-      // Customer has not mentioned any vehicle model yet -> do not send model-specific photos prematurely
-      return false;
-    }
-
     const productMediaMatches = Array.from(responseText.matchAll(/<PRODUCT_MEDIA>([\s\S]*?)<\/PRODUCT_MEDIA>/gi));
     const requestedMediaProductIds = productMediaMatches
       .flatMap((m) => m[1].split(","))
@@ -802,14 +763,10 @@ CRITICAL SECURITY RULE:
         console.log(`[MediaController] Blocked product "${prod.name}" (${prod.id}): product has 0 images`);
         continue;
       }
-      if (!isProductModelCompatible(prod.name)) {
-        console.log(`[MediaController] Blocked model-specific product "${prod.name}" due to vehicle mismatch`);
-        continue;
-      }
 
-      // Fix 3: Specific URL-level check + Explicit Photo Request Override
-      // If the customer explicitly asked for photos ("photo ewanna", "send pictures"), allow all valid product images;
-      // otherwise filter out specific image URLs already sent within the active session window.
+      // Specific URL-level check + Explicit Photo Request Override
+      // If the customer explicitly asked for photos ("Photos iruka", "photo ewanna"), allow all valid product images;
+      // otherwise filter out specific image URLs already sent within the active 6-hour session window.
       const candidateUrls = prod.images
         .map((u: string) => String(u || "").trim())
         .filter((u: string) => u && (customerExplicitlyAskedForPhotos || !alreadySentProductMedia.has(u)));
@@ -847,9 +804,7 @@ CRITICAL SECURITY RULE:
 
     if (videoProd && videoProd.video_url && String(videoProd.video_url).trim()) {
       const vUrl = String(videoProd.video_url).trim();
-      if (!isProductModelCompatible(videoProd.name)) {
-        console.log(`[MediaController] Blocked model-specific video for "${videoProd.name}" due to vehicle mismatch`);
-      } else if (alreadySentProductMedia.has(vUrl) && !customerExplicitlyAskedForVideo) {
+      if (alreadySentProductMedia.has(vUrl) && !customerExplicitlyAskedForVideo) {
         console.log(`[MediaController] Skipped video for "${videoProd.name}": already sent in active session to ${phoneNumber}`);
       } else {
         resolvedVideoUrl = vUrl;
