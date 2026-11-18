@@ -357,6 +357,7 @@ async function processMessage(
   const replyVideoUrl = aiData.videoUrl || null;
   const followupMessage = aiData.followupMessage || null;
   const faqMedia: string[] = Array.isArray(aiData.faqMedia) ? aiData.faqMedia : [];
+  const sentProductIds: string[] = Array.isArray(aiData.sentProductIds) ? aiData.sentProductIds : [];
   console.log(`[${corrId}] AI reply: ${replyMessage?.substring(0, 100)}${replyImageUrls.length > 0 ? ` (with ${replyImageUrls.length} images)` : ""}${replyVideoUrl ? " (with video)" : ""}${followupMessage ? " (with followup)" : ""}`);
 
   // 7. Store outgoing message
@@ -366,7 +367,13 @@ async function processMessage(
     message: replyMessage,
     direction: "outbound",
     message_type: replyImageUrls.length > 0 ? "image" : "text",
-    metadata: { correlationId: corrId, ...(faqMedia.length > 0 ? { faqMedia } : {}) },
+    metadata: {
+      correlationId: corrId,
+      ...(faqMedia.length > 0 ? { faqMedia } : {}),
+      ...(replyImageUrls.length > 0 ? { imageUrls: replyImageUrls } : {}),
+      ...(replyVideoUrl ? { videoUrl: replyVideoUrl } : {}),
+      ...(sentProductIds.length > 0 ? { sentProductIds } : {}),
+    },
     user_id: userId,
   });
   mark("store_outbound_end");
