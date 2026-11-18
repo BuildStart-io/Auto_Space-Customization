@@ -197,22 +197,56 @@ serve(async (req) => {
     const faqs = faqsRes.data || [];
     const settings = settingsRes.data || [];
 
-    // Fetch prior outbound messages for this customer to enforce strict media deduplication
-    const { data: priorOutboundRows } = await supabase
-      .from("conversations")
-      .select("message, message_type, metadata")
-      .eq("user_id", userId)
-      .eq("phone_number", phoneNumber)
-      .eq("direction", "outbound")
-      .order("created_at", { ascending: false })
-      .limit(200);
+    const trimmedInputMsg = (message || "").trim();
+    // Fix 3: Detect if the customer explicitly asked to see photos or video in their current message
+    // (English, Singlish/Sinhala, Tanglish/Tamil keywords)
+    const customerExplicitlyAskedForPhotos =
+      /\b(photo|photos|picture|pictures|image|images|pic|pics|poto|sample|samples|show|pennanna|evanna|ewanna|balanna|kaatunga|katunga|anupunga|anuppunga|padam)\b|පින්තූර|ෆොටෝ|படம்|போட்டோ/i.test(trimmedInputMsg);
+    const customerExplicitlyAskedForVideo =
+      /\b(video|videos|clip|vdio|vidio|pennanna|evanna|ewanna|kaatunga|anupunga)\b|වීඩියෝ|வீடியோ/i.test(trimmedInputMsg);
+
+    // Fix 1: Active Session Time Window (6 hours) — returning customers after 6 hours get fresh photos
+    const sessionWindowStart = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+
+    // Fix 2: Post-Booking / Post-Order Reset — find the customer's most recent order in this session window
+    const [priorOutboundRes, latestOrderRes] = await Promise.all([
+      supabase
+        .from("conversations")
+        .select("message, message_type, metadata, created_at")
+        .eq("user_id", userId)
+        .eq("phone_number", phoneNumber)
+        .eq("direction", "outbound")
+        .gte("created_at", sessionWindowStart)
+        .order("created_at", { ascending: false })
+        .limit(100),
+      supabase
+        .from("orders")
+        .select("created_at")
+        .eq("user_id", userId)
+        .eq("whatsapp_phone", phoneNumber)
+        .gte("created_at", sessionWindowStart)
+        .order("created_at", { ascending: false })
+        .limit(1),
+    ]);
+
+    const priorOutboundRows = priorOutboundRes.data || [];
+    const latestOrderCreatedAt = latestOrderRes.data?.[0]?.created_at
+      ? new Date(latestOrderRes.data[0].created_at).getTime()
+      : 0;
 
     const alreadySentFaqMedia = new Set<string>();
     const alreadySentProductMedia = new Set<string>();
     const alreadySentProductIds = new Set<string>();
 
-    for (const row of priorOutboundRows || []) {
+    for (const row of priorOutboundRows) {
       const meta = (row as any)?.metadata || {};
+      const rowTime = (row as any)?.created_at ? new Date((row as any).created_at).getTime() : 0;
+
+      // Fix 2: Stop collecting sent-media history once we cross a completed booking/order boundary
+      if (meta.type === "order_followup" || (latestOrderCreatedAt > 0 && rowTime <= latestOrderCreatedAt)) {
+        break;
+      }
+
       if (Array.isArray(meta.faqMedia)) {
         meta.faqMedia.forEach((u: string) => {
           if (typeof u === "string" && u.trim()) alreadySentFaqMedia.add(u.trim());
@@ -231,7 +265,7 @@ serve(async (req) => {
           if (typeof id === "string" && id.trim()) alreadySentProductIds.add(id.trim());
         });
       }
-      // Legacy fallback for older rows where message_type === "image" but metadata.imageUrls was not saved
+      // Legacy fallback for older rows in this session where message_type === "image"
       if ((row as any)?.message_type === "image" && !Array.isArray(meta.imageUrls)) {
         const msgLower = String((row as any)?.message || "").toLowerCase();
         for (const p of products) {
@@ -271,14 +305,19 @@ serve(async (req) => {
 
       const hasImages = Array.isArray(p.images) && p.images.length > 0;
       const hasVideo = Boolean(p.video_url && String(p.video_url).trim());
+      // Specific URL-level check: only mark as already sent if every image URL of this product was already sent in the current session
       const isImagesSent =
-        alreadySentProductIds.has(p.id) ||
-        (hasImages && p.images.every((u: string) => alreadySentProductMedia.has(String(u).trim())));
-      const isVideoSent = hasVideo && alreadySentProductMedia.has(String(p.video_url).trim());
+        !customerExplicitlyAskedForPhotos &&
+        hasImages &&
+        p.images.every((u: string) => alreadySentProductMedia.has(String(u).trim()));
+      const isVideoSent =
+        !customerExplicitlyAskedForVideo &&
+        hasVideo &&
+        alreadySentProductMedia.has(String(p.video_url).trim());
 
       if (hasImages) {
         line += isImagesSent
-          ? ` | Photos: ALREADY_SENT_IN_CHAT (Do NOT attach photos again)`
+          ? ` | Photos: ALREADY_SENT_IN_CHAT (Do NOT attach photos again unless customer explicitly asks for photos)`
           : ` | Photos: AVAILABLE (${p.images.length} photo(s))`;
       } else {
         line += ` | Photos: NONE`;
@@ -286,7 +325,7 @@ serve(async (req) => {
 
       if (hasVideo) {
         line += isVideoSent
-          ? ` | Video: ALREADY_SENT_IN_CHAT (Do NOT attach video again)`
+          ? ` | Video: ALREADY_SENT_IN_CHAT (Do NOT attach video again unless customer explicitly asks for video)`
           : ` | Video: AVAILABLE`;
       } else {
         line += ` | Video: NONE`;
@@ -767,21 +806,20 @@ CRITICAL SECURITY RULE:
         console.log(`[MediaController] Blocked model-specific product "${prod.name}" due to vehicle mismatch`);
         continue;
       }
-      if (alreadySentProductIds.has(prod.id)) {
-        console.log(`[MediaController] Skipped product "${prod.name}" (${prod.id}): already sent in this conversation`);
-        continue;
-      }
 
-      const unsent = prod.images
+      // Fix 3: Specific URL-level check + Explicit Photo Request Override
+      // If the customer explicitly asked for photos ("photo ewanna", "send pictures"), allow all valid product images;
+      // otherwise filter out specific image URLs already sent within the active session window.
+      const candidateUrls = prod.images
         .map((u: string) => String(u || "").trim())
-        .filter((u: string) => u && !alreadySentProductMedia.has(u));
+        .filter((u: string) => u && (customerExplicitlyAskedForPhotos || !alreadySentProductMedia.has(u)));
 
-      if (unsent.length === 0) {
-        console.log(`[MediaController] Skipped product "${prod.name}" (${prod.id}): all images already sent to ${phoneNumber}`);
+      if (candidateUrls.length === 0) {
+        console.log(`[MediaController] Skipped product "${prod.name}" (${prod.id}): all images already sent in active session to ${phoneNumber}`);
         continue;
       }
 
-      for (const u of unsent) {
+      for (const u of candidateUrls) {
         if (!resolvedImageUrls.includes(u)) {
           resolvedImageUrls.push(u);
         }
@@ -811,8 +849,8 @@ CRITICAL SECURITY RULE:
       const vUrl = String(videoProd.video_url).trim();
       if (!isProductModelCompatible(videoProd.name)) {
         console.log(`[MediaController] Blocked model-specific video for "${videoProd.name}" due to vehicle mismatch`);
-      } else if (alreadySentProductMedia.has(vUrl)) {
-        console.log(`[MediaController] Skipped video for "${videoProd.name}": already sent to ${phoneNumber}`);
+      } else if (alreadySentProductMedia.has(vUrl) && !customerExplicitlyAskedForVideo) {
+        console.log(`[MediaController] Skipped video for "${videoProd.name}": already sent in active session to ${phoneNumber}`);
       } else {
         resolvedVideoUrl = vUrl;
         if (!sentProductIds.includes(videoProd.id)) {
